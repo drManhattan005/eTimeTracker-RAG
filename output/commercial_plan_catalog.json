@@ -1,0 +1,70 @@
+{
+  "starter": {
+    "price_model": "per_employee_monthly",
+    "price_inr_per_employee_month": 99,
+    "employee_limit": 100,
+    "employee_capacity": "limited",
+    "location_scope": "one_location",
+    "support_tier": "email",
+    "published_entitlements": [
+      "attendance",
+      "leave",
+      "basic_reports",
+      "email_support",
+      "one_location"
+    ],
+    "not_listed_in_published_plan": [
+      "geofencing",
+      "face_approvals",
+      "multi_branch",
+      "multi_tenant",
+      "custom_integrations",
+      "dedicated_account_manager",
+      "sla_guarantee"
+    ]
+  },
+  "business": {
+    "price_model": "per_employee_monthly",
+    "price_inr_per_employee_month": 249,
+    "employee_limit": 1000,
+    "employee_capacity": "limited",
+    "location_scope": "multi_branch",
+    "support_tier": "priority",
+    "published_entitlements": [
+      "attendance",
+      "leave",
+      "basic_reports",
+      "email_support",
+      "shifts",
+      "scheduling",
+      "tour_management",
+      "expense_management",
+      "geofencing",
+      "face_approvals",
+      "priority_support",
+      "multi_branch"
+    ],
+    "not_listed_in_published_plan": [
+      "multi_tenant",
+      "custom_integrations",
+      "dedicated_account_manager",
+      "sla_guarantee"
+    ]
+  },
+  "enterprise": {
+    "price_model": "custom",
+    "price_inr_per_employee_month": null,
+    "employee_limit": null,
+    "employee_capacity": "unlimited",
+    "location_scope": "multi_tenant",
+    "support_tier": "dedicated_account_manager",
+    "published_entitlements": [
+      "all_business_features",
+      "multi_tenant",
+      "custom_integrations",
+      "dedicated_account_manager",
+      "sla_guarantee"
+    ],
+    "not_listed_in_published_plan": []
+  }
+}

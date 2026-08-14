@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Git
+.git
+.gitignore
+
+# Python cache / local env
+.venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+
+# Local env files and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend build junk
+frontend/node_modules
+frontend/.next
+frontend/tsconfig.tsbuildinfo
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+
+# Generic logs / editor files
+*.log
+.vscode/
+.idea/

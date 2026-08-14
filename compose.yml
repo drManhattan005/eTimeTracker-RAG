@@ -1,0 +1,49 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: veloit-rag-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  backend:
+    image: drmanhattan005/veloit-rag-backend:v0.1.0
+    container_name: veloit-rag-backend
+    ports:
+      - "8000:8000"
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: qwen2.5:1.5b
+      CHUNKS_FILE: output/chunks.jsonl
+      QDRANT_PATH: ./qdrant_data
+      OLLAMA_NUM_CTX: "4096"
+      OLLAMA_NUM_PREDICT: "512"
+      OLLAMA_TEMPERATURE: "0.1"
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    image: drmanhattan005/veloit-rag-frontend:v0.1.0
+    container_name: veloit-rag-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      FASTAPI_BASE_URL: http://backend:8000
+      NODE_ENV: production
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  ollama_data:
