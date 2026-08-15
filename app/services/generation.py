@@ -83,6 +83,20 @@ Rules:
 7. Return JSON only. No markdown.
 """
 
+FOLLOWUP_REWRITER_SYSTEM_PROMPT = """You rewrite a follow-up user query into a standalone Veloitt product question.
+
+Return JSON only with this exact schema:
+{"rewritten_query":"..."}
+
+Rules:
+1. Use the recent conversation only to resolve references in the latest user query.
+2. Preserve the user's intent exactly.
+3. Keep it concise and retrieval-friendly.
+4. Do not invent product capabilities, policies, or facts.
+5. If the latest user query is already standalone, return it with minimal change.
+6. Return JSON only. No markdown.
+"""
+
 
 class GateDecision(BaseModel):
     label: Literal["ALLOW", "BLOCK"] = Field(
@@ -112,6 +126,11 @@ _COMMERCIAL_TERMS = {
 _OBVIOUS_BLOCKLIST = {
     "hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay", "cool",
     "nice", "hmm", "huh", "lol", "test",
+}
+
+_SHORT_FOLLOWUP_PATTERNS = {
+    "why", "how", "what about that", "what about it", "and that", "and this",
+    "can it", "does it", "is it", "why is that", "how about that",
 }
 
 
@@ -217,6 +236,36 @@ def _build_context(question: str, retrieved_chunks: list[dict]) -> str:
     return "\n\n".join(context_parts)
 
 
+def _history_to_text(history: list[dict[str, str]] | None) -> str:
+    if not history:
+        return ""
+
+    lines: list[str] = []
+    for item in history[-8:]:
+        role = (item.get("role") or "").strip().lower()
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"User: {content}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content}")
+    return "\n".join(lines)
+
+
+def _looks_like_followup(question: str, history: list[dict[str, str]] | None) -> bool:
+    if not history:
+        return False
+
+    q = _normalize_query(question)
+    if len(q.split()) <= 4:
+        if q in _SHORT_FOLLOWUP_PATTERNS:
+            return True
+        if any(token in {"it", "that", "this", "they", "those", "these"} for token in q.split()):
+            return True
+    return False
+
+
 class GenerationService:
     def __init__(self, llm: OllamaClient) -> None:
         self.llm = llm
@@ -276,32 +325,102 @@ class GenerationService:
             )
             return q
 
-    def _generate_answer(self, user_question: str, context: str) -> str:
+    def _rewrite_followup(self, question: str, history: list[dict[str, str]] | None) -> str:
+        q = (question or "").strip()
+        if not q or not history:
+            return q
+
+        prompt = (
+            "Rewrite the latest user query into a standalone Veloitt question using the recent conversation only when needed.\n\n"
+            f"Recent conversation:\n{_history_to_text(history)}\n\n"
+            f"Latest user query:\n{q}\n"
+        )
+
+        raw = self.llm.generate(prompt=prompt, system=FOLLOWUP_REWRITER_SYSTEM_PROMPT)
+
+        try:
+            data = json.loads(raw)
+            rewritten = RewriteDecision.model_validate(data).rewritten_query.strip()
+            if not rewritten:
+                return q
+            if len(rewritten) > 300:
+                return q
+            return rewritten
+        except (json.JSONDecodeError, ValidationError) as exc:
+            log.warning(
+                "[generation] follow-up rewrite parse failure; using original query | raw=%r err=%s",
+                raw[:300],
+                exc,
+            )
+            return q
+
+    def prepare_effective_query(
+        self,
+        question: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
+        if _looks_like_followup(question, history):
+            return self._rewrite_followup(question, history)
+        return self._rewrite_query(question)
+
+    def _generate_answer(
+        self,
+        user_question: str,
+        context: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"Context:\n{context}\n\n"
+        )
+
+        history_text = _history_to_text(history)
+        if history_text:
+            prompt += f"Recent conversation:\n{history_text}\n\n"
+
+        prompt += (
             f"Question:\n{user_question}\n\n"
             "Answer:"
         )
         return self.llm.generate(prompt)
 
-    def _generate_answer_stream(self, user_question: str, context: str) -> Iterator[str]:
+    def _generate_answer_stream(
+        self,
+        user_question: str,
+        context: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> Iterator[str]:
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"Context:\n{context}\n\n"
+        )
+
+        history_text = _history_to_text(history)
+        if history_text:
+            prompt += f"Recent conversation:\n{history_text}\n\n"
+
+        prompt += (
             f"Question:\n{user_question}\n\n"
             "Answer:"
         )
         yield from self.llm.generate_stream(prompt)
 
-    def answer(self, question: str, retrieved_chunks: list[dict]) -> str:
-        result = self.answer_or_abstain(question, retrieved_chunks)
+    def answer(
+        self,
+        question: str,
+        retrieved_chunks: list[dict],
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
+        result = self.answer_or_abstain(question, retrieved_chunks, history=history)
         return result["answer"]
 
     def answer_stream(
-        self, question: str, retrieved_chunks: list[dict]
+        self,
+        question: str,
+        retrieved_chunks: list[dict],
+        history: list[dict[str, str]] | None = None,
     ) -> Iterator[str]:
-        result = self.answer_or_abstain(question, retrieved_chunks)
+        result = self.answer_or_abstain(question, retrieved_chunks, history=history)
 
         if result["type"] == "ABSTAIN":
             yield result["answer"]
@@ -315,9 +434,14 @@ class GenerationService:
             yield ABSTAIN_TEMPLATE
             return
 
-        yield from self._generate_answer_stream(question, context)
+        yield from self._generate_answer_stream(question, context, history=history)
 
-    def answer_or_abstain(self, question: str, retrieved_chunks: list[dict]) -> dict:
+    def answer_or_abstain(
+        self,
+        question: str,
+        retrieved_chunks: list[dict],
+        history: list[dict[str, str]] | None = None,
+    ) -> dict:
         gate = self._classify_query(question)
 
         if gate.label == "BLOCK":
@@ -329,7 +453,7 @@ class GenerationService:
                 "rewritten_query": question,
             }
 
-        rewritten_query = self._rewrite_query(question)
+        rewritten_query = self.prepare_effective_query(question, history=history)
         filtered = _filter_hits(retrieved_chunks)
         context = _build_context(rewritten_query, filtered)
 
@@ -343,7 +467,7 @@ class GenerationService:
                 "rewritten_query": rewritten_query,
             }
 
-        answer_text = self._generate_answer(question, context)
+        answer_text = self._generate_answer(question, context, history=history)
         log.info(
             "[generation] policy=ANSWER reasoning=%r rewritten_query=%r",
             gate.reason,
