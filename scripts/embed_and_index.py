@@ -56,6 +56,92 @@ _BF_REPORT_TOPICS = [
     ("shift-based", ["shift_based"]),
 ]
 
+# ── Injected standalone authoritative commercial snippet ─────────────────────
+_AUTHORITATIVE_SNIPPET_CHUNK_ID = "commercial_authoritative_plan_rules_snippet"
+
+_AUTHORITATIVE_COMMERCIAL_SNIPPET = """PLAN RULES — AUTHORITATIVE
+
+Starter
+- ₹99 per employee/month
+- Up to 100 employees
+- Attendance & Leave, Basic Reports, Email Support, 1 Location
+
+Business
+- ₹249 per employee/month
+- Up to 1,000 employees
+- All Starter features, Shifts & Scheduling, Tour & Expense Management,
+  Geofencing, Face Approvals, Priority Support, Multi-branch
+
+Enterprise
+- Custom pricing tailored to scale; no public fixed numeric price
+- Unlimited employees
+- All Business features, Multi-tenant Admin, Custom Integrations,
+  Dedicated Account Manager, SLA Guarantee
+
+HARD RULES
+- More than 1,000 employees: recommend Enterprise, never Business or Starter.
+- 101–1,000 employees: Starter is ineligible; Business is the standard fit.
+- 100 employees or fewer: Starter may fit if only its listed capabilities are needed.
+- Dedicated Account Manager, SLA Guarantee, Custom Integrations, and
+  Multi-tenant Admin are Enterprise-only published entitlements.
+- Do not claim a feature, support channel, integration, or pricing detail
+  unless it appears in retrieved evidence.
+- If a feature is absent from retrieved evidence, say:
+  “I can’t confirm that from the available product information.”
+"""
+
+
+def _make_authoritative_snippet_chunk() -> dict:
+    return {
+        "id": _AUTHORITATIVE_SNIPPET_CHUNK_ID,
+        "chunk_id": _AUTHORITATIVE_SNIPPET_CHUNK_ID,
+        "text": _AUTHORITATIVE_COMMERCIAL_SNIPPET,
+        "metadata": {
+            "chunk_id": _AUTHORITATIVE_SNIPPET_CHUNK_ID,
+            "intent_sphere": "commercial",
+            "chunk_type": "authoritative_plan_rules",
+            "atomic": False,
+            "plan_tier": "all",
+            "section": {
+                "h1": "Commercial Sphere",
+                "h2": "PLAN RULES — AUTHORITATIVE",
+            },
+            "heading_path_text": "Commercial Sphere > PLAN RULES — AUTHORITATIVE",
+            "questions": [
+                "which plan should i choose",
+                "what is the pricing of starter business enterprise",
+                "which plan fits more than 1000 employees",
+                "does enterprise include sla guarantee",
+                "does enterprise include dedicated account manager",
+                "what support comes with each plan",
+            ],
+            "supports": [
+                "plan_selection",
+                "plan_pricing",
+                "plan_comparison",
+                "support_entitlements",
+                "commercial_queries",
+            ],
+            "caveats": [
+                "use only retrieved evidence",
+                "do not claim unpublished pricing details",
+                "do not claim unpublished support channels or integrations",
+            ],
+            "priority": "high",
+            "retrieval_priority": 100,
+            "source": "embed_and_index_injected_snippet",
+        },
+    }
+
+
+def _inject_authoritative_snippet(chunks: list[dict]) -> list[dict]:
+    filtered_chunks = [
+        c for c in chunks
+        if (c.get("chunk_id") or c.get("id")) != _AUTHORITATIVE_SNIPPET_CHUNK_ID
+    ]
+    filtered_chunks.append(_make_authoritative_snippet_chunk())
+    return filtered_chunks
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Payload sanitisation for Qdrant
@@ -283,6 +369,8 @@ def main() -> None:
 
     if not chunks:
         raise SystemExit(f"No chunks found in {CHUNKS_FILE}.")
+
+    chunks = _inject_authoritative_snippet(chunks)
 
     print(f"Loaded {len(chunks)} chunks from {CHUNKS_FILE}")
 

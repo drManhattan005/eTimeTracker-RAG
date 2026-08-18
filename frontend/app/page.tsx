@@ -13,7 +13,12 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { useChatStream, ChatMessage } from "@/hooks/useChatStream";
+import type { CSSProperties } from "react";
+import {
+  useChatStream,
+  ChatMessage,
+  SessionTokenBudget,
+} from "@/hooks/useChatStream";
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
@@ -28,6 +33,9 @@ function MessageBubble({
 
   return (
     <div className={`message-row ${isUser ? "user-row" : "assistant-row"}`}>
+      {isUser && message.tokenSnapshot && (
+        <TokenUsageRing snapshot={message.tokenSnapshot} />
+      )}
       <div className={`bubble ${isUser ? "user-bubble" : "assistant-bubble"}`}>
         <span className="bubble-role">{isUser ? "You" : "Veloitt"}</span>
         <p className="bubble-text">
@@ -39,10 +47,48 @@ function MessageBubble({
   );
 }
 
+function TokenUsageRing({ snapshot }: { snapshot: SessionTokenBudget }) {
+  const total = Math.max(snapshot.session_tokens_total, 1);
+  const used = Math.max(0, Math.min(snapshot.session_tokens_used, total));
+  const remaining = Math.max(0, snapshot.session_tokens_remaining);
+  const percent = Math.min(100, Math.round((used / total) * 100));
+  const angle = (percent / 100) * 360;
+  const ringHue = Math.max(0, 140 - percent * 1.4);
+  const ringColor = `hsl(${ringHue} 78% 48%)`;
+
+  return (
+    <div
+      className="token-ring-wrap"
+      aria-label={`Conversation tokens used: ${used} of ${total}`}
+      style={
+        {
+          "--token-angle": `${angle}deg`,
+          "--token-color": ringColor,
+        } as CSSProperties
+      }
+    >
+      <div className="token-ring">
+        <span>{percent}%</span>
+      </div>
+      <div className="token-ring-tooltip" role="tooltip">
+        <span>{used} / {total} tokens</span>
+        <span>{remaining} / {total} remaining</span>
+      </div>
+    </div>
+  );
+}
+
 // ── Main Page Component ───────────────────────────────────────────────────────
 
 export default function ChatPage() {
-  const { messages, isStreaming, error, sendMessage, reset } = useChatStream();
+  const {
+    messages,
+    isStreaming,
+    error,
+    sendMessage,
+    reset,
+    sessionBlocked,
+  } = useChatStream();
   const [theme, setTheme] = useState<"dark" | "light">("dark");
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -65,7 +111,7 @@ export default function ChatPage() {
   function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const input = inputRef.current;
-    if (!input || !input.value.trim() || isStreaming) return;
+    if (!input || !input.value.trim() || isStreaming || sessionBlocked) return;
     sendMessage(input.value);
     input.value = "";
   }
@@ -120,12 +166,14 @@ export default function ChatPage() {
                 <div className="suggestions-grid">
                   <button
                     className="suggestion-chip"
+                    disabled={isStreaming || sessionBlocked}
                     onClick={() => sendMessage("How does eTimeTracker handle field sales attendance?")}
                   >
                     Field sales attendance tracking
                   </button>
                   <button
                     className="suggestion-chip"
+                    disabled={isStreaming || sessionBlocked}
                     onClick={() => sendMessage("What leave approval workflows are supported?")}
                   >
                     Leave approval workflows
@@ -154,13 +202,20 @@ export default function ChatPage() {
           {/* ── Floating Pill Input Bar ──────────────────────────────── */}
           <div className="pill-input-container">
             <form className="pill-input-form" onSubmit={handleSubmit}>
+              {sessionBlocked && (
+                <LimitIcon />
+              )}
               <input
                 ref={inputRef}
                 id="question-input"
                 className="pill-input"
                 type="text"
-                placeholder="Ask eTimeTracker assistant…"
-                disabled={isStreaming}
+                placeholder={
+                  sessionBlocked
+                    ? "Query limit reached, restart convo"
+                    : "Ask eTimeTracker assistant…"
+                }
+                disabled={isStreaming || sessionBlocked}
                 autoComplete="off"
                 aria-label="Question input"
               />
@@ -168,7 +223,7 @@ export default function ChatPage() {
                 id="send-btn"
                 className="pill-send-btn"
                 type="submit"
-                disabled={isStreaming}
+                disabled={isStreaming || sessionBlocked}
                 aria-label="Send question"
               >
                 {isStreaming ? (
@@ -246,6 +301,27 @@ function MoonIcon() {
       aria-hidden="true"
     >
       <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
+}
+
+function LimitIcon() {
+  return (
+    <svg
+      className="limit-icon"
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 8v4" />
+      <path d="M12 16h.01" />
     </svg>
   );
 }

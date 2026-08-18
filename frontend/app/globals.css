@@ -253,6 +253,11 @@ input {
   background: var(--accent-dim);
 }
 
+.suggestion-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ── Message Bubbles ───────────────────────────────────────────────────────── */
 
 .message-row {
@@ -262,10 +267,76 @@ input {
 
 .user-row {
   justify-content: flex-end;
+  align-items: flex-start;
+  gap: 8px;
 }
 
 .assistant-row {
   justify-content: flex-start;
+}
+
+.token-ring-wrap {
+  --token-angle: 0deg;
+  --token-color: #22c55e;
+  position: relative;
+  flex: 0 0 auto;
+  margin-top: 4px;
+}
+
+.token-ring {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background:
+    conic-gradient(var(--token-color) var(--token-angle), var(--border) 0deg);
+  transition: background 0.25s ease;
+}
+
+.token-ring::before {
+  content: "";
+  position: absolute;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--bg-base);
+}
+
+.token-ring span {
+  position: relative;
+  z-index: 1;
+  color: var(--text-primary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.token-ring-tooltip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  min-width: 150px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+  display: grid;
+  gap: 3px;
+  font-size: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 20;
+}
+
+.token-ring-wrap:hover .token-ring-tooltip,
+.token-ring-wrap:focus-within .token-ring-tooltip {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .bubble {
@@ -356,6 +427,16 @@ input {
   border-color: var(--accent);
 }
 
+.pill-input-form:has(.pill-input:disabled) {
+  opacity: 0.72;
+}
+
+.limit-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  margin-right: 8px;
+}
+
 .pill-input {
   flex: 1;
   height: 44px;
@@ -368,6 +449,10 @@ input {
 
 .pill-input::placeholder {
   color: var(--text-muted);
+}
+
+.pill-input:disabled {
+  cursor: not-allowed;
 }
 
 .pill-send-btn {

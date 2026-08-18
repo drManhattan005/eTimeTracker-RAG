@@ -4,9 +4,8 @@ app/api/routes.py
 FastAPI router factory with lightweight in-memory session history.
 
 Design:
-- Retrieval remains current-turn focused.
-- Conversation history is used only for follow-up resolution and answer grounding.
-- Short/ambiguous follow-ups can be rewritten against recent turns before retrieval.
+- Keeps only the last 3 prior turns plus the current question path.
+- Retrieval and generation both receive the same trimmed history.
 - Session state is in-memory only and resets on server restart.
 """
 
@@ -16,7 +15,6 @@ import json
 import logging
 import re
 import threading
-import time
 import uuid
 from collections import defaultdict
 from collections.abc import Generator
@@ -29,6 +27,11 @@ from pydantic import BaseModel, Field
 from app.config import settings
 from app.services.generation import GenerationService
 from app.services.retrieval import RetrievalService
+from app.services.token_budget import (
+    estimate_messages_tokens,
+    estimate_tokens,
+    trim_messages_to_budget,
+)
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +42,9 @@ _RETRIEVAL_ROUTE: str = (
     f"HYBRID:dense(k={RETRIEVAL_DENSE_K})+BM25(k={RETRIEVAL_BM25_K})+RRF→top{RETRIEVAL_LIMIT}"
 )
 
-_HISTORY_MAX_TURNS = 8
+_HISTORY_MAX_TURNS = 3
 _SESSION_STORE: dict[str, list[dict[str, str]]] = defaultdict(list)
+_SESSION_BUDGET_STORE: dict[str, dict] = {}
 _SESSION_LOCK = threading.Lock()
 _LEAK_PATTERNS = [
     r"\n\s*Question\s*:",
@@ -64,6 +68,10 @@ class QueryResponse(BaseModel):
     model: str
     retrieval_route: str
     session_id: str
+    session_tokens_used: int
+    session_tokens_total: int
+    session_tokens_remaining: int
+    session_blocked: bool = False
 
 
 class SessionResetRequest(BaseModel):
@@ -93,9 +101,10 @@ def _clean_hit(h: dict) -> dict:
 
 
 def _trim_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
-    if len(history) <= _HISTORY_MAX_TURNS * 2:
+    max_messages = _HISTORY_MAX_TURNS * 2
+    if len(history) <= max_messages:
         return history
-    return history[-(_HISTORY_MAX_TURNS * 2) :]
+    return history[-max_messages:]
 
 
 def _get_session_history(session_id: str) -> list[dict[str, str]]:
@@ -107,12 +116,18 @@ def _append_session_turn(session_id: str, role: Literal["user", "assistant"], co
     with _SESSION_LOCK:
         history = _SESSION_STORE[session_id]
         history.append({"role": role, "content": content})
-        _SESSION_STORE[session_id] = _trim_history(history)
+        trimmed = _trim_history(history)
+        trimmed, _, _ = trim_messages_to_budget(
+            trimmed,
+            settings.SESSION_SOFT_TURN_BUDGET,
+        )
+        _SESSION_STORE[session_id] = trimmed
 
 
 def _reset_session(session_id: str) -> None:
     with _SESSION_LOCK:
         _SESSION_STORE.pop(session_id, None)
+        _SESSION_BUDGET_STORE.pop(session_id, None)
 
 
 def _sanitize_model_output(text: str) -> tuple[str, bool]:
@@ -126,6 +141,66 @@ def _sanitize_model_output(text: str) -> tuple[str, bool]:
     return cleaned.rstrip(), False
 
 
+def _history_for_model(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    trimmed = _trim_history(history)
+    trimmed, _, _ = trim_messages_to_budget(
+        trimmed,
+        settings.SESSION_SOFT_TURN_BUDGET,
+    )
+    return trimmed
+
+
+def _session_tokens_used(session_id: str) -> int:
+    with _SESSION_LOCK:
+        budget = _SESSION_BUDGET_STORE.get(session_id, {})
+        return int(budget.get("tokens_used", 0))
+
+
+def _session_budget_fields(tokens_used: int) -> dict:
+    total = settings.SESSION_LIFETIME_MAX_TOKENS
+    used = min(max(0, tokens_used), total)
+    return {
+        "session_tokens_used": used,
+        "session_tokens_total": total,
+        "session_tokens_remaining": max(0, total - used),
+        "session_blocked": used >= total,
+    }
+
+
+def _is_materially_different(question: str, effective_question: str) -> bool:
+    normalized_question = re.sub(r"\s+", " ", question.strip().lower())
+    normalized_effective = re.sub(r"\s+", " ", effective_question.strip().lower())
+    return bool(normalized_effective and normalized_effective != normalized_question)
+
+
+def _request_usage_delta(
+    question: str,
+    effective_question: str,
+    budget: dict,
+    answer: str,
+) -> int:
+    total = estimate_tokens(question)
+    if _is_materially_different(question, effective_question):
+        total += estimate_tokens(effective_question)
+    total += int(budget.get("final_prompt_estimate_tokens", 0) or 0)
+    total += estimate_tokens(answer)
+    return total
+
+
+def _add_session_usage(session_id: str, delta_tokens: int) -> dict:
+    with _SESSION_LOCK:
+        current = int(_SESSION_BUDGET_STORE.get(session_id, {}).get("tokens_used", 0))
+        next_used = current + max(0, delta_tokens)
+        fields = _session_budget_fields(next_used)
+        _SESSION_BUDGET_STORE[session_id] = {
+            "tokens_used": fields["session_tokens_used"],
+            "tokens_total": fields["session_tokens_total"],
+            "tokens_remaining": fields["session_tokens_remaining"],
+            "session_blocked": fields["session_blocked"],
+        }
+        return fields
+
+
 def make_router(
     retrieval_service: RetrievalService,
     generation_service: GenerationService,
@@ -137,9 +212,18 @@ def make_router(
     def health() -> dict:
         return {
             "status": "ok",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "model": _model,
             "retrieval_route": _RETRIEVAL_ROUTE,
+            "history_turns": _HISTORY_MAX_TURNS,
+            "session_budget": {
+                "max_tokens": settings.SESSION_MAX_TOKENS,
+                "max_input_tokens": settings.SESSION_MAX_INPUT_TOKENS,
+                "max_output_tokens": settings.SESSION_MAX_OUTPUT_TOKENS,
+                "soft_turn_budget": settings.SESSION_SOFT_TURN_BUDGET,
+                "lifetime_max_tokens": settings.SESSION_LIFETIME_MAX_TOKENS,
+                "enforce_by": settings.session_enforce_by,
+            },
         }
 
     @router.post("/session/reset")
@@ -150,170 +234,227 @@ def make_router(
     @router.post("/query", response_model=QueryResponse)
     def query(request: QueryRequest) -> QueryResponse:
         req_id = uuid.uuid4().hex[:8]
-        history = _get_session_history(request.session_id)
+        current_budget = _session_budget_fields(_session_tokens_used(request.session_id))
+
+        if current_budget["session_blocked"]:
+            log.info(
+                "[req:%s] session blocked | session=%s used=%d total=%d",
+                req_id,
+                request.session_id,
+                current_budget["session_tokens_used"],
+                current_budget["session_tokens_total"],
+            )
+            return QueryResponse(
+                question=request.question,
+                effective_question=request.question,
+                answer=settings.SESSION_LIMIT_REACHED_MESSAGE,
+                hits=[],
+                model=_model,
+                retrieval_route=_RETRIEVAL_ROUTE,
+                session_id=request.session_id,
+                **current_budget,
+            )
+
+        raw_history = _get_session_history(request.session_id)
+        history = _history_for_model(raw_history)
+        log.info(
+            "[req:%s] session budget start | session=%s raw_messages=%d "
+            "kept_messages=%d session_tokens=%d",
+            req_id,
+            request.session_id,
+            len(raw_history),
+            len(history),
+            estimate_messages_tokens(history),
+        )
+
         effective_question = generation_service.prepare_effective_query(
             question=request.question,
             history=history,
         )
 
-        log.info(
-            "[req:%s] query | model=%s route=%s session=%s question=%r effective=%r",
-            req_id,
-            _model,
-            _RETRIEVAL_ROUTE,
-            request.session_id,
-            request.question[:100],
-            effective_question[:140],
-        )
-
         hits = retrieval_service.search(
-            effective_question,
-            limit=RETRIEVAL_LIMIT,
+            query=effective_question,
+            history=history,
+            limit=request.limit,
             dense_k=RETRIEVAL_DENSE_K,
             bm25_k=RETRIEVAL_BM25_K,
         )
 
-        chunk_ids = [h.get("chunk_id") or h.get("id", "") for h in hits]
-        log.info("[req:%s] hits  | count=%d chunks=%s", req_id, len(hits), chunk_ids)
-
-        answer = generation_service.answer(
+        result = generation_service.answer_or_abstain(
             question=request.question,
+            effective_question=effective_question,
             retrieved_chunks=hits,
             history=history,
         )
+        answer = result["answer"]
+
+        cleaned_answer, leaked = _sanitize_model_output(answer)
+        if leaked:
+            log.warning(
+                "[req:%s] stripped leaked prompt markers from /query response",
+                req_id,
+            )
 
         _append_session_turn(request.session_id, "user", request.question)
-        _append_session_turn(request.session_id, "assistant", answer)
+        _append_session_turn(request.session_id, "assistant", cleaned_answer)
+        usage_delta = _request_usage_delta(
+            request.question,
+            effective_question,
+            result.get("budget", {}),
+            cleaned_answer,
+        )
+        session_budget = _add_session_usage(request.session_id, usage_delta)
+
+        log.info(
+            "[req:%s] query complete | session=%s question=%r effective=%r "
+            "hits=%d final_prompt_tokens=%s usage_delta=%d session_used=%d/%d",
+            req_id,
+            request.session_id,
+            request.question,
+            effective_question,
+            len(hits),
+            result.get("budget", {}).get("final_prompt_estimate_tokens"),
+            usage_delta,
+            session_budget["session_tokens_used"],
+            session_budget["session_tokens_total"],
+        )
 
         return QueryResponse(
             question=request.question,
             effective_question=effective_question,
-            answer=answer,
+            answer=cleaned_answer,
             hits=[_clean_hit(h) for h in hits],
             model=_model,
             retrieval_route=_RETRIEVAL_ROUTE,
             session_id=request.session_id,
+            **session_budget,
         )
 
     @router.post("/query/stream")
     def query_stream(request: QueryRequest) -> StreamingResponse:
         req_id = uuid.uuid4().hex[:8]
-        t_start = time.monotonic()
-        history = _get_session_history(request.session_id)
+        current_budget = _session_budget_fields(_session_tokens_used(request.session_id))
+
+        if current_budget["session_blocked"]:
+            log.info(
+                "[req:%s] stream session blocked | session=%s used=%d total=%d",
+                req_id,
+                request.session_id,
+                current_budget["session_tokens_used"],
+                current_budget["session_tokens_total"],
+            )
+
+            def blocked_stream() -> Generator[str, None, None]:
+                yield _ndjson(
+                    {
+                        "type": "meta",
+                        "session_id": request.session_id,
+                        "question": request.question,
+                        "effective_question": request.question,
+                        "retrieval_route": _RETRIEVAL_ROUTE,
+                        "model": _model,
+                        "hits": [],
+                        **current_budget,
+                    }
+                )
+                yield _ndjson(
+                    {
+                        "type": "done",
+                        "answer": settings.SESSION_LIMIT_REACHED_MESSAGE,
+                        **current_budget,
+                    }
+                )
+
+            return StreamingResponse(
+                blocked_stream(),
+                media_type="application/x-ndjson",
+            )
+
+        raw_history = _get_session_history(request.session_id)
+        history = _history_for_model(raw_history)
+        log.info(
+            "[req:%s] session budget start | session=%s raw_messages=%d "
+            "kept_messages=%d session_tokens=%d",
+            req_id,
+            request.session_id,
+            len(raw_history),
+            len(history),
+            estimate_messages_tokens(history),
+        )
+
         effective_question = generation_service.prepare_effective_query(
             question=request.question,
             history=history,
         )
 
-        log.info(
-            "[req:%s] query/stream | model=%s route=%s session=%s question=%r effective=%r",
-            req_id,
-            _model,
-            _RETRIEVAL_ROUTE,
-            request.session_id,
-            request.question[:100],
-            effective_question[:140],
+        hits = retrieval_service.search(
+            query=effective_question,
+            history=history,
+            limit=request.limit,
+            dense_k=RETRIEVAL_DENSE_K,
+            bm25_k=RETRIEVAL_BM25_K,
         )
 
-        try:
-            hits = retrieval_service.search(
-                effective_question,
-                limit=RETRIEVAL_LIMIT,
-                dense_k=RETRIEVAL_DENSE_K,
-                bm25_k=RETRIEVAL_BM25_K,
-            )
-            chunk_ids = [h.get("chunk_id") or h.get("id", "") for h in hits]
-            log.info("[req:%s] hits  | count=%d chunks=%s", req_id, len(hits), chunk_ids)
-        except Exception as exc:
-            log.exception("[req:%s] retrieval_error | %s", req_id, exc)
-
-            def retrieval_error_stream() -> Generator[str, None, None]:
-                yield _ndjson(
-                    {
-                        "type": "error",
-                        "error": "retrieval_failed",
-                        "message": "Could not retrieve relevant context.",
-                    }
-                )
-
-            return StreamingResponse(
-                retrieval_error_stream(),
-                media_type="application/x-ndjson",
-            )
+        log.info(
+            "[req:%s] stream start | session=%s question=%r effective=%r",
+            req_id,
+            request.session_id,
+            request.question,
+            effective_question,
+        )
 
         def event_stream() -> Generator[str, None, None]:
-            try:
-                result = generation_service.answer_or_abstain(
-                    question=request.question,
-                    retrieved_chunks=hits,
-                    history=history,
+            yield _ndjson(
+                {
+                    "type": "meta",
+                    "session_id": request.session_id,
+                    "question": request.question,
+                    "effective_question": effective_question,
+                    "retrieval_route": _RETRIEVAL_ROUTE,
+                    "model": _model,
+                    "hits": [_clean_hit(h) for h in hits],
+                    **current_budget,
+                }
+            )
+
+            result = generation_service.answer_or_abstain(
+                question=request.question,
+                effective_question=effective_question,
+                retrieved_chunks=hits,
+                history=history,
+            )
+            answer = result["answer"]
+
+            cleaned_answer, leaked = _sanitize_model_output(answer)
+            if leaked:
+                log.warning(
+                    "[req:%s] stripped leaked prompt markers from /query/stream response",
+                    req_id,
                 )
-                response_type = str(result.get("type", "")).upper()
 
-                yield _ndjson(
-                    {
-                        "type": "meta",
-                        "response_type": response_type,
-                        "model": _model,
-                        "retrieval_route": _RETRIEVAL_ROUTE,
-                        "session_id": request.session_id,
-                        "effective_question": effective_question,
-                        "hits": [_clean_hit(h) for h in hits],
-                    }
-                )
+            _append_session_turn(request.session_id, "user", request.question)
+            _append_session_turn(request.session_id, "assistant", cleaned_answer)
+            usage_delta = _request_usage_delta(
+                request.question,
+                effective_question,
+                result.get("budget", {}),
+                cleaned_answer,
+            )
+            session_budget = _add_session_usage(request.session_id, usage_delta)
 
-                final_answer = ""
+            log.info(
+                "[req:%s] stream complete | session=%s hits=%d "
+                "final_prompt_tokens=%s usage_delta=%d session_used=%d/%d",
+                req_id,
+                request.session_id,
+                len(hits),
+                result.get("budget", {}).get("final_prompt_estimate_tokens"),
+                usage_delta,
+                session_budget["session_tokens_used"],
+                session_budget["session_tokens_total"],
+            )
 
-                if response_type == "ABSTAIN":
-                    final_answer = result["answer"]
-                    yield _ndjson({"type": "token", "token": final_answer})
-                else:
-                    streamed_text = ""
-                    emitted_text = ""
-
-                    for token in generation_service.answer_stream(
-                        question=request.question,
-                        retrieved_chunks=hits,
-                        history=history,
-                    ):
-                        if not token:
-                            continue
-
-                        streamed_text += token
-                        cleaned_text, was_truncated = _sanitize_model_output(streamed_text)
-
-                        if len(cleaned_text) > len(emitted_text):
-                            delta = cleaned_text[len(emitted_text):]
-                            if delta:
-                                emitted_text = cleaned_text
-                                yield _ndjson({"type": "token", "token": delta})
-
-                        if was_truncated:
-                            log.warning(
-                                "[req:%s] output_sanitized | leak_pattern_detected=true",
-                                req_id,
-                            )
-                            break
-
-                    final_answer = emitted_text.strip() or result["answer"]
-
-                _append_session_turn(request.session_id, "user", request.question)
-                _append_session_turn(request.session_id, "assistant", final_answer)
-
-                yield _ndjson({"type": "done", "response_type": response_type})
-
-            except Exception as exc:
-                log.exception("[req:%s] stream_error | %s", req_id, exc)
-                yield _ndjson(
-                    {
-                        "type": "error",
-                        "error": "generation_failed",
-                        "message": "Could not generate a response.",
-                    }
-                )
-            finally:
-                elapsed = time.monotonic() - t_start
-                log.info("[req:%s] stream_done | elapsed=%.3fs", req_id, elapsed)
+            yield _ndjson({"type": "done", "answer": cleaned_answer, **session_budget})
 
         return StreamingResponse(
             event_stream(),

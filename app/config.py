@@ -56,6 +56,32 @@ class _Settings:
     # ~4 chars ≈ 1 token. 5000 chars ≈ 1250 tokens.
     MAX_CONTEXT_CHARS: int = int(os.environ.get("MAX_CONTEXT_CHARS", "5000"))
 
+    # ── Per-session prompt budget ──────────────────────────────────────────
+    # qwen2.5:1.5b has a 4096-token context window here, but the app should not
+    # spend that whole window on prompt input. These defaults reserve practical
+    # headroom for the system prompt, retrieved chunks, formatting, concurrent
+    # server load, and a bounded answer from a small local model.
+    SESSION_MAX_TOKENS: int = int(os.environ.get("SESSION_MAX_TOKENS", "3000"))
+    SESSION_MAX_INPUT_TOKENS: int = int(os.environ.get("SESSION_MAX_INPUT_TOKENS", "2400"))
+    SESSION_MAX_OUTPUT_TOKENS: int = int(os.environ.get("SESSION_MAX_OUTPUT_TOKENS", "600"))
+
+    # Soft cap for prior kept conversation turns inside each request. The route
+    # still keeps only the last 3 turns first; this is a second guardrail that
+    # trims unusually long turns while preserving the newest messages.
+    SESSION_SOFT_TURN_BUDGET: int = int(os.environ.get("SESSION_SOFT_TURN_BUDGET", "800"))
+
+    # Hard cumulative lifetime cap for one ephemeral conversation/session. Once
+    # reached, the session must be reset before accepting another query.
+    SESSION_LIFETIME_MAX_TOKENS: int = int(os.environ.get("SESSION_LIFETIME_MAX_TOKENS", "6000"))
+    SESSION_LIMIT_REACHED_MESSAGE: str = os.environ.get(
+        "SESSION_LIMIT_REACHED_MESSAGE",
+        "Query limit reached. Restart convo.",
+    )
+
+    # "tokens" uses an optional tokenizer if installed, otherwise a conservative
+    # approximation. "chars" forces the same chars/word fallback estimator.
+    SESSION_ENFORCE_BY: str = os.environ.get("SESSION_ENFORCE_BY", "tokens").lower()
+
     # Default number of retrieval hits.
     RETRIEVAL_LIMIT_DEFAULT: int = int(os.environ.get("RETRIEVAL_LIMIT_DEFAULT", "5"))
 
@@ -67,7 +93,7 @@ class _Settings:
         """Per-request options dict passed to Ollama /api/generate."""
         return {
             "num_ctx": self.OLLAMA_NUM_CTX,
-            "num_predict": self.OLLAMA_NUM_PREDICT,
+            "num_predict": min(self.OLLAMA_NUM_PREDICT, self.SESSION_MAX_OUTPUT_TOKENS),
             "temperature": self.OLLAMA_TEMPERATURE,
         }
 
@@ -75,6 +101,12 @@ class _Settings:
     def ollama_timeout(self) -> tuple[int, int]:
         """(connect_timeout, read_timeout) for requests."""
         return (self.OLLAMA_CONNECT_TIMEOUT, self.OLLAMA_READ_TIMEOUT)
+
+    @property
+    def session_enforce_by(self) -> str:
+        if self.SESSION_ENFORCE_BY in {"tokens", "chars"}:
+            return self.SESSION_ENFORCE_BY
+        return "tokens"
 
 
 settings = _Settings()

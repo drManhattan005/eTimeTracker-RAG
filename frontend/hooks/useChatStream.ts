@@ -1,274 +1,330 @@
-/**
- * hooks/useChatStream.ts
- * ───────────────────────
- * React hook that streams NDJSON answers from POST /api/chat.
- */
+import { useCallback, useMemo, useRef, useState } from "react";
 
-"use client";
+export type ChatRole = "user" | "assistant";
 
-import { useCallback, useRef, useState } from "react";
-
-export type MessageRole = "user" | "assistant";
-
-export interface ChatMessage {
+export type ChatMessage = {
   id: string;
-  role: MessageRole;
+  role: ChatRole;
   content: string;
-}
+  tokenSnapshot?: SessionTokenBudget;
+};
 
-export interface SourceHit {
+export type RetrievedHit = {
   id: string;
+  chunk_id: string;
   score: number;
-  section: { h2?: string; h3?: string };
-  intent_sphere: string;
-  text_preview: string;
+  fused_score?: number;
+  dense_rank?: number | null;
+  bm25_rank?: number | null;
+  section?: string | Record<string, unknown>;
+  intent_sphere?: string;
+  chunk_type?: string;
+  plan_tier?: string;
+  text_preview?: string;
+};
+
+export type StreamMeta = {
+  session_id: string;
+  question: string;
+  effective_question: string;
+  retrieval_route: string;
+  model: string;
+  hits: RetrievedHit[];
+  session_tokens_used?: number;
+  session_tokens_total?: number;
+  session_tokens_remaining?: number;
+  session_blocked?: boolean;
+};
+
+export type SessionTokenBudget = {
+  session_tokens_used: number;
+  session_tokens_total: number;
+  session_tokens_remaining: number;
+  session_blocked: boolean;
+};
+
+const HISTORY_TURNS = 3;
+const DEFAULT_API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+
+function createId() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-interface StreamStats {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  eval_ms?: number;
-  total_ms?: number;
+function trimMessagesForUi(messages: ChatMessage[]) {
+  return messages;
 }
 
-interface TokenEvent {
-  type: "token";
-  token?: string;
-  content?: string;
+function trimMessagesForServer(messages: ChatMessage[]) {
+  const maxMessages = HISTORY_TURNS * 2;
+  return messages.slice(-maxMessages);
 }
 
-interface MetaEvent {
-  type: "meta";
-  hits?: SourceHit[];
-  session_id?: string;
-  effective_question?: string;
-}
-
-interface ErrorEvent {
-  type: "error";
-  message: string;
-}
-
-interface DoneEvent {
-  type: "done";
-  done_reason?: string;
-  response_type?: string;
-  stats?: StreamStats;
-}
-
-type StreamEvent = TokenEvent | MetaEvent | ErrorEvent | DoneEvent;
-
-function uid(): string {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-function makeSessionId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `session_${Date.now()}_${uid()}`;
-}
-
-function parseLine(line: string): StreamEvent | null {
-  const trimmed = line.trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed) as StreamEvent;
-  } catch {
-    if (process.env.NODE_ENV !== "production") {
-      console.warn("[useChatStream] unparseable NDJSON line:", trimmed.slice(0, 120));
-    }
+function toSessionTokenBudget(event: Partial<SessionTokenBudget>) {
+  if (
+    typeof event.session_tokens_used !== "number" ||
+    typeof event.session_tokens_total !== "number" ||
+    typeof event.session_tokens_remaining !== "number"
+  ) {
     return null;
   }
+
+  return {
+    session_tokens_used: event.session_tokens_used,
+    session_tokens_total: event.session_tokens_total,
+    session_tokens_remaining: event.session_tokens_remaining,
+    session_blocked: Boolean(event.session_blocked),
+  };
 }
 
 export function useChatStream() {
+  const apiBaseUrl = DEFAULT_API_BASE_URL;
+
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [meta, setMeta] = useState<StreamMeta | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [hits, setHits] = useState<SourceHit[]>([]);
-  const [doneReason, setDoneReason] = useState<string>("");
+  const [sessionTokenState, setSessionTokenState] =
+    useState<SessionTokenBudget | null>(null);
+  const [sessionBlocked, setSessionBlocked] = useState(false);
+  const [sessionId, setSessionId] = useState(() => createId());
 
-  const assistantIdRef = useRef<string | null>(null);
+  const sessionIdRef = useRef<string>(sessionId);
   const abortRef = useRef<AbortController | null>(null);
-  const sessionIdRef = useRef<string>(makeSessionId());
 
-  const sendMessage = useCallback(async (question: string) => {
-    const trimmed = question.trim();
-    if (!trimmed) return;
+  const sendMessage = useCallback(
+    async (content: string) => {
+      const question = content.trim();
+      if (!question || isStreaming || sessionBlocked) return;
 
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
+      setError(null);
 
-    setError(null);
-    setHits([]);
-    setDoneReason("");
-    setIsStreaming(true);
+      const userMessage: ChatMessage = {
+        id: createId(),
+        role: "user",
+        content: question,
+        tokenSnapshot: sessionTokenState ?? undefined,
+      };
 
-    const userMsg: ChatMessage = { id: uid(), role: "user", content: trimmed };
-    const assistantId = uid();
-    assistantIdRef.current = assistantId;
-    const assistantMsg: ChatMessage = {
-      id: assistantId,
-      role: "assistant",
-      content: "",
-    };
+      const assistantMessageId = createId();
+      const historyForServer = trimMessagesForServer(messages);
 
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+      setMessages((prev) => [
+        ...trimMessagesForUi([...prev, userMessage]),
+        { id: assistantMessageId, role: "assistant", content: "" },
+      ]);
+      setIsStreaming(true);
+      setMeta(null);
 
-    let streamEndedCleanly = false;
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-    try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: trimmed,
-          session_id: sessionIdRef.current,
-          limit: 3,
-        }),
-        signal: controller.signal,
-      });
+      try {
+        const response = await fetch(`${apiBaseUrl}/query/stream`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          signal: controller.signal,
+          body: JSON.stringify({
+            question,
+            session_id: sessionIdRef.current,
+            limit: 12,
+            history: historyForServer,
+          }),
+        });
 
-      if (!response.body) {
-        throw new Error("Response has no body");
-      }
+        if (!response.ok || !response.body) {
+          throw new Error(`Request failed with status ${response.status}`);
+        }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finalAnswer = "";
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
+          buffer += decoder.decode(value, { stream: true });
 
-        for (const line of lines) {
-          const event = parseLine(line);
-          if (!event) continue;
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
 
-          if (event.type === "meta") {
-            setHits(event.hits ?? []);
-            if (event.session_id && event.session_id.trim()) {
-              sessionIdRef.current = event.session_id.trim();
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (!line) continue;
+
+            const event = JSON.parse(line) as
+              | {
+                type: "meta";
+                hits: RetrievedHit[];
+                session_id: string;
+                question: string;
+                effective_question: string;
+                retrieval_route: string;
+                model: string;
+                session_tokens_used?: number;
+                session_tokens_total?: number;
+                session_tokens_remaining?: number;
+                session_blocked?: boolean;
+              }
+              | { type: "token"; text?: string; token?: string }
+              | {
+                type: "done";
+                answer: string;
+                session_tokens_used?: number;
+                session_tokens_total?: number;
+                session_tokens_remaining?: number;
+                session_blocked?: boolean;
+              }
+              | {
+                type: "error";
+                message?: string;
+                session_tokens_used?: number;
+                session_tokens_total?: number;
+                session_tokens_remaining?: number;
+                session_blocked?: boolean;
+              };
+
+            if (event.type === "meta") {
+              setMeta({
+                session_id: event.session_id,
+                question: event.question,
+                effective_question: event.effective_question,
+                retrieval_route: event.retrieval_route,
+                model: event.model,
+                hits: event.hits ?? [],
+                session_tokens_used: event.session_tokens_used,
+                session_tokens_total: event.session_tokens_total,
+                session_tokens_remaining: event.session_tokens_remaining,
+                session_blocked: event.session_blocked,
+              });
+              continue;
             }
-            continue;
-          }
 
-          if (event.type === "token") {
-            const piece = event.token ?? event.content ?? "";
-            if (!piece) continue;
+            if (event.type === "token") {
+              finalAnswer += event.text ?? event.token ?? "";
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantMessageId
+                    ? { ...msg, content: finalAnswer }
+                    : msg
+                )
+              );
+              continue;
+            }
 
-            setMessages((prev) =>
-              prev.map((msg) =>
-                msg.id === assistantId
-                  ? { ...msg, content: msg.content + piece }
-                  : msg
-              )
-            );
-            continue;
-          }
+            if (event.type === "error") {
+              const message = event.message ?? "Something went wrong";
+              finalAnswer = message;
+              setError(message);
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantMessageId
+                    ? { ...msg, content: finalAnswer }
+                    : msg
+                )
+              );
+              continue;
+            }
 
-          if (event.type === "error") {
-            setError(event.message || "Something went wrong.");
-
-            setMessages((prev) =>
-              prev.map((msg) =>
-                msg.id === assistantId
-                  ? {
-                    ...msg,
-                    content: msg.content || event.message || "Something went wrong.",
-                  }
-                  : msg
-              )
-            );
-            continue;
-          }
-
-          if (event.type === "done") {
-            streamEndedCleanly = true;
-            setDoneReason(event.done_reason ?? event.response_type ?? "done");
-            setIsStreaming(false);
+            if (event.type === "done") {
+              finalAnswer = event.answer;
+              const completedBudget = toSessionTokenBudget(event);
+              if (completedBudget) {
+                setSessionTokenState(completedBudget);
+                setSessionBlocked(completedBudget.session_blocked);
+              }
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantMessageId
+                    ? { ...msg, content: finalAnswer }
+                    : msg.id === userMessage.id && completedBudget
+                      ? { ...msg, tokenSnapshot: completedBudget }
+                    : msg
+                )
+              );
+            }
           }
         }
-      }
-
-      if (buffer.trim()) {
-        const event = parseLine(buffer);
-        if (event?.type === "token") {
-          const piece = event.token ?? event.content ?? "";
-          if (piece) {
-            setMessages((prev) =>
-              prev.map((msg) =>
-                msg.id === assistantId
-                  ? { ...msg, content: msg.content + piece }
-                  : msg
-              )
-            );
-          }
-        } else if (event?.type === "meta") {
-          setHits(event.hits ?? []);
-          if (event.session_id && event.session_id.trim()) {
-            sessionIdRef.current = event.session_id.trim();
-          }
-        } else if (event?.type === "error") {
-          setError(event.message || "Something went wrong.");
-        } else if (event?.type === "done") {
-          streamEndedCleanly = true;
-          setDoneReason(event.done_reason ?? event.response_type ?? "done");
-          setIsStreaming(false);
-        }
-      }
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError") {
-        setDoneReason("aborted");
-      } else {
+      } catch (err) {
         const message =
-          err instanceof Error ? err.message : "Something went wrong.";
+          err instanceof Error ? err.message : "Something went wrong";
         setError(message);
         setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantId
-              ? {
-                ...msg,
-                content: msg.content || message,
-              }
-              : msg
-          )
+          prev.filter((msg) => msg.id !== assistantMessageId)
         );
-      }
-    } finally {
-      if (!streamEndedCleanly) {
+      } finally {
+        abortRef.current = null;
         setIsStreaming(false);
       }
-      abortRef.current = null;
-    }
-  }, []);
+    },
+    [apiBaseUrl, isStreaming, messages, sessionBlocked, sessionTokenState]
+  );
 
-  const reset = useCallback(() => {
+  const reset = useCallback(async () => {
     abortRef.current?.abort();
     abortRef.current = null;
-    assistantIdRef.current = null;
-    sessionIdRef.current = makeSessionId();
+
+    const oldSessionId = sessionIdRef.current;
+    const nextSessionId = createId();
+    sessionIdRef.current = nextSessionId;
+    setSessionId(nextSessionId);
+
     setMessages([]);
-    setIsStreaming(false);
+    setMeta(null);
     setError(null);
-    setHits([]);
-    setDoneReason("");
+    setIsStreaming(false);
+    setSessionTokenState(null);
+    setSessionBlocked(false);
+
+    try {
+      await fetch(`${apiBaseUrl}/session/reset`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          session_id: oldSessionId,
+        }),
+      });
+    } catch {
+      // noop
+    }
+  }, [apiBaseUrl]);
+
+  const stop = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsStreaming(false);
   }, []);
 
-  return {
-    messages,
-    isStreaming,
-    error,
-    hits,
-    doneReason,
-    sendMessage,
-    reset,
-    sessionId: sessionIdRef.current,
-  };
+  return useMemo(
+    () => ({
+      messages,
+      isStreaming,
+      meta,
+      error,
+      sessionTokenState,
+      sessionBlocked,
+      sessionId,
+      sendMessage,
+      reset,
+      stop,
+    }),
+    [
+      messages,
+      isStreaming,
+      meta,
+      error,
+      sessionTokenState,
+      sessionBlocked,
+      sessionId,
+      sendMessage,
+      reset,
+      stop,
+    ]
+  );
 }
