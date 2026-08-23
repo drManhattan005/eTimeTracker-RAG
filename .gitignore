@@ -40,3 +40,7 @@ backup/
 # Optional local OS/tool files
 *.swp
 *.swo
+
+#data artifacts
+output/
+qdrant_data/

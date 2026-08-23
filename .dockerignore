@@ -32,3 +32,8 @@ frontend/tsconfig.tsbuildinfo
 
 # Logs
 *.log
+
+#data artifcats
+
+output/
+qdrant_data/
