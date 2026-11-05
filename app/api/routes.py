@@ -206,7 +206,7 @@ def make_router(
     generation_service: GenerationService,
 ) -> APIRouter:
     router = APIRouter()
-    _model = settings.OLLAMA_MODEL
+    _model = settings.GEMINI_MODEL
 
     @router.get("/health")
     def health() -> dict:

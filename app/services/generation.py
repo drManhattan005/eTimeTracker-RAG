@@ -25,7 +25,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
-from app.infrastructure.llm import OllamaClient
+from app.infrastructure.llm import GeminiClient
 from app.services.token_budget import estimate_tokens, safe_input_budget, trim_messages_to_budget
 
 log = logging.getLogger(__name__)
@@ -330,8 +330,16 @@ def _looks_like_followup(question: str, history: list[dict[str, str]] | None) ->
     return False
 
 
+def _clean_json_str(raw: str) -> str:
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
 class GenerationService:
-    def __init__(self, llm: OllamaClient) -> None:
+    def __init__(self, llm: GeminiClient) -> None:
         self.llm = llm
 
     def _classify_query(self, question: str) -> GateDecision:
@@ -347,7 +355,7 @@ class GenerationService:
         raw = self.llm.generate(prompt=prompt, system=CLASSIFIER_SYSTEM_PROMPT)
 
         try:
-            data = json.loads(raw)
+            data = json.loads(_clean_json_str(raw))
             decision = GateDecision.model_validate(data)
             return decision
         except (json.JSONDecodeError, ValidationError) as exc:
@@ -374,7 +382,7 @@ class GenerationService:
         raw = self.llm.generate(prompt=prompt, system=REWRITER_SYSTEM_PROMPT)
 
         try:
-            data = json.loads(raw)
+            data = json.loads(_clean_json_str(raw))
             rewritten = RewriteDecision.model_validate(data).rewritten_query.strip()
             if not rewritten:
                 return q
@@ -403,7 +411,7 @@ class GenerationService:
         raw = self.llm.generate(prompt=prompt, system=FOLLOWUP_REWRITER_SYSTEM_PROMPT)
 
         try:
-            data = json.loads(raw)
+            data = json.loads(_clean_json_str(raw))
             rewritten = RewriteDecision.model_validate(data).rewritten_query.strip()
             if not rewritten:
                 return q

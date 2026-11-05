@@ -23,7 +23,6 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Environment files and secrets
-.env
 .env.*
 !.env.example
 

@@ -2,10 +2,10 @@
 """
 scripts/validate_end2end.py
 ────────────────────────────
-End-to-End RAG benchmark validation script for qwen2.5:1.5b.
+End-to-End RAG benchmark validation script for Google Gemini Cloud API.
 
 Executes the actual runtime answer path:
-  Hybrid Retrieval -> Context Assembly -> Qwen 2.5 1.5B LLM Generation
+  Hybrid Retrieval -> Context Assembly -> Gemini LLM Generation
 for all 8 known Buyer Fit & Commercial benchmark prompts.
 
 Usage:
@@ -22,7 +22,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from app.config import settings
 from app.infrastructure.embedders import FastEmbedder
-from app.infrastructure.llm import OllamaClient
+from app.infrastructure.llm import GeminiClient
 from app.infrastructure.vectorstores.qdrant_store import QdrantVectorStore
 from app.services.generation import GenerationService
 from app.services.retrieval import RetrievalService
@@ -127,12 +127,12 @@ def run_benchmark() -> None:
         vector_store=vector_store,
         chunks_file=settings.CHUNKS_FILE,
     )
-    llm = OllamaClient(
-        model_name=settings.OLLAMA_MODEL,
-        base_url=settings.OLLAMA_BASE_URL,
-        timeout=settings.ollama_timeout,
-        keep_alive=settings.OLLAMA_KEEP_ALIVE,
-        options=settings.ollama_options,
+    llm = GeminiClient(
+        model_name=settings.GEMINI_MODEL,
+        api_key=settings.GEMINI_API_KEY,
+        temperature=settings.GEMINI_TEMPERATURE,
+        max_output_tokens=settings.GEMINI_MAX_OUTPUT_TOKENS,
+        timeout=settings.GEMINI_TIMEOUT,
     )
     generation_service = GenerationService(llm=llm)
 

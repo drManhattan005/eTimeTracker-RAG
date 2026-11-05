@@ -83,15 +83,15 @@ def test_stream(question: str, base_url: str) -> None:
                     print(f"  total_elapsed_ms : {elapsed}")
                     print(f"{'='*60}\n")
 
-                    if reason == "length":
-                        print("⚠  WARNING: done_reason=length — answer was cut off by num_predict cap!")
-                        print("   Increase OLLAMA_NUM_PREDICT env var (currently 1024).")
-                    elif reason == "stop":
+                    if reason in ("length", "MAX_TOKENS"):
+                        print("⚠  WARNING: done_reason=length — answer was cut off by max_output_tokens cap!")
+                        print("   Increase GEMINI_MAX_OUTPUT_TOKENS env var (currently 1024).")
+                    elif reason in ("stop", "STOP"):
                         print("✓  Stream ended cleanly at stop token.")
 
     except requests.Timeout:
         print("\n[TIMEOUT] The request timed out. "
-              "Increase OLLAMA_READ_TIMEOUT or check if Ollama is running.")
+              "Increase GEMINI_TIMEOUT or check network connection.")
         sys.exit(1)
     except requests.ConnectionError:
         print(f"\n[ERROR] Could not connect to {url}. Is the FastAPI server running?")

@@ -8,7 +8,7 @@ visible in the server console:
 
   ┌──────────────────────────────────────────────────────────────┐
   │  Veloitt RAG API  – startup configuration                    │
-  │  LLM model   : qwen2.5:1.5b (Ollama)                        │
+  │  LLM model   : gemini-2.5-flash (Gemini Cloud API)          │
   │  Retrieval   : HYBRID  dense(Qdrant/MiniLM) + BM25 → RRF    │
   │  dense pool  : k=15   BM25 pool : k=15   top hits : 12      │
   │  Chunks      : 47 prebuilt  (output/chunks.jsonl)            │
@@ -36,7 +36,7 @@ from qdrant_client import QdrantClient
 from app.config import settings
 from app.domain.models import PrebuiltChunk
 from app.infrastructure.embedders import FastEmbedder
-from app.infrastructure.llm import OllamaClient
+from app.infrastructure.llm import GeminiClient
 from app.infrastructure.vectorstores.qdrant_store import QdrantVectorStore
 from app.services.generation import GenerationService
 from app.services.indexing import IndexingService
@@ -91,12 +91,12 @@ def create_app() -> FastAPI:
         chunks_file=chunks_file,
     )
 
-    llm = OllamaClient(
-        model_name=settings.OLLAMA_MODEL,
-        base_url=settings.OLLAMA_BASE_URL,
-        timeout=settings.ollama_timeout,
-        keep_alive=settings.OLLAMA_KEEP_ALIVE,
-        options=settings.ollama_options,
+    llm = GeminiClient(
+        model_name=settings.GEMINI_MODEL,
+        api_key=settings.GEMINI_API_KEY,
+        temperature=settings.GEMINI_TEMPERATURE,
+        max_output_tokens=settings.GEMINI_MAX_OUTPUT_TOKENS,
+        timeout=settings.GEMINI_TIMEOUT,
     )
     generation_service = GenerationService(llm=llm)
 
@@ -116,7 +116,7 @@ def create_app() -> FastAPI:
         "│  BM25        : %-45s│\n"
         "│  Chunks      : %-3d prebuilt  (%s)   │\n"
         "└──────────────────────────────────────────────────────────────┘",
-        f"{settings.OLLAMA_MODEL} (Ollama)",
+        f"{settings.GEMINI_MODEL} (Gemini Cloud API)",
         RETRIEVAL_DENSE_K,
         RETRIEVAL_BM25_K,
         RETRIEVAL_LIMIT,
